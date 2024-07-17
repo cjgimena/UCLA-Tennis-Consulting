@@ -14,3 +14,8 @@ Contains folders with all outstanding projects.
 ## Swing Vision
 * Converting swing vision data to a spreadsheet that can be passed through the tagging - check
 
+## Webscraping
+* Aggregating data from various tennis websites to get point by point data.
+* Adding timestamps from recordings to get something that can be uploaded to the website
+* Target Websites: 
+
