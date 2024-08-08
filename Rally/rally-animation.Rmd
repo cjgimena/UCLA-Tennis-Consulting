@@ -1,0 +1,450 @@
+---
+title: "match-animation"
+author: "Tony Jeon"
+date: "2024-08-01"
+output: html_document
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE)
+```
+
+## R Markdown
+
+# Loading Libraries & Cleaning Data
+
+```{r message=FALSE, warning=FALSE}
+library(dplyr)
+library(knitr)
+library(reshape2)
+library(readr)
+library(ggplot2)
+library(gganimate)
+library(gifski)
+library(gridExtra)
+
+events <- read_csv("Shot_Visuals_EliseWagle_MotkaKomac.csv")
+events <- events %>%
+    rename(
+      rallyid = pointNumber,
+      hitter_x = shotContactX,
+      hitter_y = shotContactY,
+      strokeid = shotInRally,
+      hitter = shotHitBy
+    ) %>%
+    mutate(
+      # Reflect across axis
+      hitter_x = -hitter_x,
+      server = hitter,
+      receiver_x = 0,
+      receiver_y = 0,
+      receiver = returnerName,
+      # Set default serve coordinates
+      hitter_x = if_else(strokeid == 1, 
+                         case_when(
+                           serverFarNear == "Near" & side == "Deuce" ~ -50,
+                           serverFarNear == "Near" & side == "Ad" ~ 50,
+                           serverFarNear == "Far" & side == "Deuce" ~ 50,
+                           serverFarNear == "Far" & side == "Ad" ~ -50,
+                           TRUE ~ hitter_x  # Default case
+                         ), 
+                         hitter_x),
+      hitter_y = if_else(strokeid == 1,
+                         if_else(serverFarNear == "Near", -475, 475), 
+                         hitter_y),
+      score = paste(gameScore, pointScore, sep = ", ")
+    )
+
+points <- events %>% filter(isPointEnd == 1.0)
+
+serves <- events %>%
+  filter(strokeid == 1) %>%
+  # Account for reflection across axis
+  mutate(
+    x = if_else(firstServeIn == 1.0, -firstServeXCoord, -secondServeXCoord), 
+    y = if_else(firstServeIn == 1.0, firstServeYCoord, secondServeYCoord)
+  ) %>%
+  select(rallyid, server, x, y)
+```
+
+# Exploring the Court
+
+With this dataset giving very precise coordinates for the event data, it would be insane not to try to plot that data on an actual court! 
+Lucky for us, the dataset owner has published the fitting coordinates in the first kernel, which means we can create a tennis court quite easily with `ggplot`:
+
+```{r out.width='100%', out.height='auto', warning=FALSE}
+
+out_bounds <- data.frame(
+    x = c(-455, -455, 455, 455, -455),
+    y = c(-210, 210, 210, -210, -210)
+)
+
+t_lines <- data.frame(
+    x = c(-245, -245, -245, 245, 245, 245),
+    y = c(-157.5, 157.5, 0, 0, -157.5, 157.5)
+)
+
+# Left is nearside, right is farside
+court <- ggplot() +
+    geom_path(data = out_bounds, aes(x = x, y = y)) +
+    geom_path(data = t_lines, aes(x = x, y = y)) +
+    geom_path(aes(x = c(-455, 455), y = c(-157, -157))) + # lower singles lines
+    geom_path(aes(x = c(-455, 455), y = c(157, 157))) + # upper singles lines
+    geom_path(aes(x = c(0, 0), y = c(-240, 240))) + # net line
+    geom_path(aes(x = c(-455, -445), y = c(0, 0))) + # left hash line
+    geom_path(aes(x = c(445, 455), y = c(0, 0))) + # right hash line
+    ylim(c(-400, 400)) + xlim(c(-700, 700)) + 
+    theme_void()
+
+court
+```
+
+All good, except that the axes here are swapped in comparison to the original format, which means we'll have to do a quick adjustment of the columnnames. 
+
+```{r}
+events <- events %>%
+    rename(hitter_x = hitter_y,
+           hitter_y = hitter_x,
+           receiver_x = receiver_y,
+           receiver_y = receiver_x)
+
+points <- points %>%
+    rename(hitter_x = hitter_y,
+           hitter_y = hitter_x,
+           receiver_x = receiver_y,
+           receiver_y = receiver_x)
+
+serves <- serves %>%
+    rename(y = x,
+           x = y)
+```
+
+With the key variables being switched - or the coordinates transposed, if you wish - we can start to visualize data on the aforementioned court!
+
+```{r out.width='100%', out.height='auto', warning=FALSE}
+court +
+    geom_point(data = events,
+             aes(x = hitter_x, y = hitter_y, colour = hitter)) +
+    theme(legend.position = "bottom", 
+          plot.title = element_text(hjust = 0.5)) +
+    ggtitle("Hitter Positions")
+```
+
+This graphic gives a general idea about where the game is "taking place" on the court, as it shows where the ball was hit by a player.
+
+The following graphic shows us from where a winner was hit:
+
+```{r out.width='100%', out.height='auto', warning=FALSE}
+winners <- points %>%
+    filter(isWinner == 1.0)
+
+court +
+    geom_point(data = winners, aes(x = hitter_x, y = hitter_y, colour = pointWonBy)) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(hjust = 0.5)) +
+    ggtitle("Winner Positions")
+
+```
+
+## Animating the Serve
+
+First of, let's take a look at serves! 
+I'm interested in the travel path of a ball from the server to the returner, so let's create an animated plot of serves to the returner.
+Before we can create that animations, we've got some reshaping to do.
+We will need to replace the receiver coordinates from the `serves` table, because we are actually interested in the location of the receiver when he returns the serves, not where he stands on the serve!
+
+Additionally, we'll melt the data.frame in which the three points of interests build one observation, so that we create a `3 x 2` matrix for each rally.
+
+```{r}
+tmp <- events %>% 
+    filter(strokeid == 1) %>% 
+    select(rallyid, receiver, hitter_x, hitter_y, receiver_x, receiver_y) %>% 
+    right_join(serves, by = "rallyid")
+
+
+ # The next two assignments take care of only including serves with a return
+sec_stroke <- events %>% 
+    filter(strokeid == 2) %>% 
+    rename(return_x = hitter_x, return_y = hitter_y) %>% 
+    select(rallyid, return_y, return_x)
+
+tmp <-  tmp %>% inner_join(sec_stroke, by = "rallyid") %>% 
+    mutate(
+        receiver_x = return_x,
+        receiver_y = return_y
+    ) %>% 
+    select(-return_y, -return_x)
+
+ # We start melting the frames to create coordinate matrices for each rally
+tmp_mx <- tmp %>%
+    rename(hitter = hitter_x,
+           coord = x,
+           receive = receiver_x) %>% 
+    melt(id.vars = c("rallyid", "server", "receiver"),
+         measure.vars = c("hitter", "coord", "receive")
+    ) %>% 
+    rename(x_kind = variable,
+           x = value)
+
+tmp_my <- tmp %>%
+    rename(hitter = hitter_y,
+           coord = y,
+           receive = receiver_y) %>% 
+    melt(id.vars = c("rallyid", "server", "receiver"),
+         measure.vars = c("hitter", "coord", "receive")
+    ) %>% 
+    rename(y_kind = variable,
+           y = value)
+
+df <- inner_join(tmp_mx, tmp_my[, c("rallyid", "y_kind", "y")], by = c("rallyid", "x_kind" = "y_kind"))
+```
+
+Now we can take a first look at the service game!
+
+```{r out.width='100%', out.height='auto'}
+serve_p <- court +
+    geom_path(data = df, aes(x = x, y = y, group = rallyid, color = server)) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(hjust = 0.5)) +
+    ggtitle("Serve Direction")
+
+serve_p
+```
+
+This is quite messy, which is unsurprising. 
+Can we make this a little more clearer, perhaps with points?
+
+```{r out.width='100%', out.height='auto'}
+serve_p +
+    geom_point(data = df, aes(x = x, y = y, group = rallyid, color = server))
+```
+
+Well, the answer is no. The plot is too busy and actually wants to tell a story, rather than just painting this picture.
+Let's get that story out!
+
+```{r out.width='100%', out.height='auto'}
+df <- arrange(df, rallyid)
+df$index <- 1:nrow(df)
+
+gif <- court +
+    geom_path(data = df, aes(x = x, y = y, group = rallyid, color = server)) +
+    theme(legend.position = "bottom",
+          plot.title = element_text(hjust = 0.5)) +
+    ggtitle("Serve Direction") +
+    geom_point(data = df, aes(x = x, y = y, group = rallyid, color = server)) +
+    transition_reveal(index)
+
+# animate(gif, nframes = nrow(df)*3)
+```
+
+<center><img src="https://media.giphy.com/media/gIkCPYakjA6R60kCGR/giphy.gif"></center>
+
+## Animating Rallies
+
+If we want to replay certain points, we'll have to rearrange the events dataset. 
+Below, we use `melt()` twice again, to get a matrix of positions for a given rallyid, its dimensions depending on the number of strokes in the rally. 
+As an example: If we want to have every position of the ball for the first rally - which had three strokes in it - the dimensions would be `3 x 2` again.
+
+```{r}
+ball_x <- events %>%
+    melt(id.vars = c("rallyid", "strokeid", "hitter", "receiver"),
+         measure.vars = c("hitter_x")
+    ) %>%
+    rename(x_kind = variable,
+           x = value)
+ball_y <- events %>%
+    melt(id.vars = c("rallyid", "strokeid", "hitter", "receiver"),
+         measure.vars = c("hitter_y")
+    ) %>%
+    rename(y_kind = variable,
+           y = value)
+
+ball_pos <- inner_join(ball_x, ball_y[, c("rallyid", "strokeid", "y")], by = c("rallyid", "strokeid"))
+
+kable(head(arrange(ball_pos, rallyid)))
+```
+
+With the matrix done again, we'll set up the ggplot object we want to animate. 
+However, before we do that, we'll repaint our court in the classic Australian Open style.
+
+```{r out.width='100%', out.height='auto'}
+court_b <- ggplot() +
+    geom_path(data = out_bounds, aes(x = x, y = y), colour = "white", size = 1.5, lineend = "square") +
+    geom_path(data = t_lines, aes(x = x, y = y), colour = "white", size = 1.5, lineend = "square") +
+    geom_path(aes(x = c(-455, 455), y = c(-157, -157)), colour = "white", size = 1.5, lineend = "square") + # lower singles lines
+    geom_path(aes(x = c(-455, 455), y = c(157, 157)), colour = "white", size = 1.5, lineend = "square") + # upper singles lines
+    geom_path(aes(x = c(0, 0), y = c(-240, 240)), lty = 1, colour = "white", size = 1.5, lineend = "square") + # net line
+    ylim(c(-400, 400)) + xlim(c(-700, 700)) +
+    theme_void() +
+    theme(
+        plot.background = element_rect("#5080B0")
+    )
+court_b
+```
+
+With this out of the way, let us check the hits out again, not animated.
+
+```{r out.width='100%', out.height='auto'}
+court_b +
+    geom_point(data = ball_pos, aes(x = x, y = y), colour = "yellow")
+```
+
+This seems very familiar to the static plots we have started with, but that is obviously not what we want. 
+We want to replay points! And to do that, we'll need to check out which points we want those to be. 
+Let's do an example with a long rally. 
+
+```{r out.width='100%', out.height='auto'}
+ani_df <- ball_pos %>%
+    filter(rallyid == 120)
+
+rally_points <- court_b +
+    geom_point(data = ani_df, aes(x = x, y = y), colour = "yellow")
+
+rally_lines <- court_b +
+    geom_point(data = ani_df, aes(x = x, y = y), colour = "yellow") +
+    geom_path(data = ani_df, aes(x = x, y = y), colour = "yellow")
+
+
+
+rally_points
+rally_lines
+```
+
+Animating the ball movements from here is a piece of cake!
+First, we'll animate the lower graph, because it allows us to follow the past of the exchange better.
+
+```{r out.width='100%', out.height='auto'}
+gif_lines <- rally_lines +
+    transition_reveal(strokeid)
+
+gif_lines
+```
+<center><img src="https://media.giphy.com/media/W646cKX1jTejKio4nc/giphy.gif"></center>
+
+Like this we can analyze the way the players handled their positioning, and basically where they hit the ball. 
+In the next section, we'll try to make the rally look more like a replay!
+
+## Creating the Replay Engine
+
+If we want to have an `R`-based replay engine, we could go with the following route:
+
+```{r out.width='100%', out.height='auto', warning=FALSE}
+gif_ball <- court_b +
+    geom_point(data = ani_df, aes(x = x, y = y), colour = "yellow") +
+    geom_path(data = ani_df, aes(x = x, y = y), colour = NA) +
+    transition_reveal(strokeid)
+
+animate(gif_ball, nframes = 200)
+```
+<center><img src="https://media.giphy.com/media/cIh29hWEvP9pTm9nGb/giphy.gif"></center>
+
+This gives us the base for replaying points. The next steps are to add the relevant player on each side, so that we can follow the replay more closely.
+Lucky us, that information is available from the events to! We'll need to interpolate between hits for each player. Let's give that a try!
+
+```{r}
+# First, create new variables for the positions
+base <- ball_pos %>%
+    mutate(
+        wagle_x = ifelse(hitter == "Elise Wagle", x, NA),
+        wagle_y = ifelse(hitter == "Elise Wagle", y, NA),
+        komac_x = ifelse(hitter == "Motka Komac", x, NA),
+        komac_y = ifelse(hitter == "Motka Komac", y, NA)
+        )
+
+# Fill the new variables with starting positions for the return player
+base <- base %>%
+    left_join(events[c("rallyid", "strokeid", "receiver_x", "receiver_y")], by = c("rallyid", "strokeid")) %>%
+    mutate(
+        wagle_x = ifelse((strokeid == 1 & receiver == "Elise Wagle"), receiver_x, wagle_x),
+        wagle_y = ifelse(strokeid == 1 & receiver == "Elise Wagle", receiver_y, wagle_y),
+        komac_x = ifelse(strokeid == 1 & receiver == "Motka Komac", receiver_x, komac_x),
+        komac_y = ifelse(strokeid == 1 & receiver == "Motka Komac", receiver_y, komac_y)
+    ) %>%
+    select(-receiver_x, -receiver_y)
+
+
+# Fill the new variables with the end positions of a rally
+base <- base %>%
+    group_by(rallyid) %>%
+    mutate(
+        wagle_x = ifelse(strokeid == max(strokeid) & strokeid != 1 & receiver == "Elise Wagle",
+                         wagle_x[strokeid == max(strokeid) - 1],
+                         wagle_x),
+        wagle_y = ifelse(strokeid == max(strokeid) & strokeid != 1 & receiver == "Elise Wagle",
+                         wagle_y[strokeid == max(strokeid) - 1],
+                         wagle_y),
+        komac_x = ifelse(strokeid == max(strokeid) & strokeid != 1 & receiver == "Motka Komac",
+                       komac_x[strokeid == max(strokeid) - 1],
+                       komac_x),
+        komac_y = ifelse(strokeid == max(strokeid) & strokeid != 1 & receiver == "Motka Komac",
+                       komac_y[strokeid == max(strokeid) - 1],
+                       komac_y),
+    )
+
+# Interpolate between the respective hits
+base <- base %>%
+    group_by(rallyid) %>%
+    mutate(
+        wagle_x = ifelse(is.na(wagle_x), (lag(wagle_x) + lead(wagle_x))/2, wagle_x),
+        wagle_y = ifelse(is.na(wagle_y), (lag(wagle_y) + lead(wagle_y))/2, wagle_y),
+        komac_x = ifelse(is.na(komac_x), (lag(komac_x) + lead(komac_x))/2, komac_x),
+        komac_y = ifelse(is.na(komac_y), (lag(komac_y) + lead(komac_y))/2, komac_y)
+    )
+
+base <- base %>%
+    left_join(points[, c("rallyid", "score")], by = "rallyid") %>%
+    filter(!is.na("score"))
+
+```
+
+Now we've got a table holding all information we could ask for (right now).
+We know the position of the ball and the position of the players, meaning we can animate a replay! 
+
+For comparison's sake, we'll go with the same example as before!
+
+```{r out.width='100%', out.height='auto', warning=FALSE}
+ani_df <- base %>% filter(rallyid == 15)
+
+gif_replay <- court_b +
+    # ball
+    geom_point(data = ani_df, aes(x = x, y = y), colour = "yellow", size = 3) +
+    geom_path(data = ani_df, aes(x = x, y = y), colour = NA) +
+    # Wagle
+    # geom_point(data = ani_df, aes(x = wagle_x, y = wagle_y), size = 8, col = "orange") +
+    # geom_text(data = ani_df, aes(x = wagle_x, y = wagle_y, label = "W")) +
+    # Komac
+    # geom_point(data = ani_df, aes(x = komac_x, y = komac_y), size = 8, col = "white") +
+    # geom_text(data = ani_df, aes(x = komac_x, y = komac_y, label = "K")) +
+    transition_reveal(strokeid)
+
+# animate(gif_replay, nframes = 240, fps = 40)
+```
+
+## HUD
+
+Adding some kind of a HUD is a pretty easy addition, as you can see below:
+
+```{r message=FALSE, warning=FALSE}
+# score <- ani_df[1, "score"]
+# serve <- ani_df[1, "hitter"]
+# 
+# gif_hud <- court_b +
+#     ylim(c(-1, 14)) +
+#     geom_text(aes(x = 2, y = 13.5, label = paste0("Score: ", score)), color = "white") +
+#     geom_text(aes(x = 2, y = 12.5, label = paste0("Serve: ", serve)), color = "white") +
+#     #geom_text(data = ani_df, aes(x = 6, y = 13.5, label = round(strokenum)), color = "white") +
+#      # ball
+#     geom_point(data = ani_df, aes(x = x, y = y), colour = "yellow", size = 3) +
+#     geom_path(data = ani_df, aes(x = x, y = y), colour = NA) +     
+#     # nadal
+#     geom_point(data = ani_df, aes(x = wagle_x, y = wagle_y), size = 8, col = "orange") + 
+#     geom_text(data = ani_df, aes(x = wagle_x, y = wagle_y, label = "N")) +
+#     # djokovic
+#     geom_point(data = ani_df, aes(x = komac_x, y = komac_y), size = 8, col = "white") +
+#     geom_text(data = ani_df, aes(x = komac_x, y = komac_y, label = "D")) +
+#     transition_reveal(strokeid)
+# 
+# #animate(gif_hud, nframes = 200, fps = 20)    
+```
+<center><img src="https://media.giphy.com/media/eGljbBu73Yu8Dkav7n/giphy.gif"></center>
+
